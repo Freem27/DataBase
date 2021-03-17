@@ -24,6 +24,12 @@ MsQueryFactory.Instance.ConfigureConnection(new MsConnection("localhost", "ttk",
 MsQueryFactory factory2 = MsQueryFactory.NewFactory(new MsConnection("localhost", "database2", "", "", useWinAuth: true).ToConnectionString(), "db2");
 ```
 
+MsQueryFactory выполняет по 10 запросов в рамках одного подключения. Если в момент добавления нового запроса в рамках подключения уже выполняется 10 будет создано еще одно подключение с таким же лимитом запросов. Количество создаваемых подключений не ограничего. После выполнения запросов производится чистка. Не используемые подключения закрываются.
+Можно изменить лимит запросов на одно соединение с БД:
+```c#
+MsQueryFactory.Instance.transactionLimithPerConnection = 20;
+```
+
 ## Получение данных (select\exec для табличных функций)
 
 ```c#
@@ -121,12 +127,92 @@ if (q.withError)
     Console.WriteLine(q.error);
 ```
 
+реализована возможность биндить в запрос списки
+```c#
+List<int> idList = new List<int>() { 1, 2, 3 };
+MsQuery q = MsQueryFactory.NewQuery("select * from sys.databses where database_id in (@list)").AddParametersList<int>("@list", idList);
+```
 
 # withForJson
-обработка запросов MsSql возвращающих занчения в формате json
+MsSql может возвращать результаты запроса в формате JSON. Чтобы получать результат в виде JObject\JArray реализован класс, возвращающий занчения в формате json
+```c#
+var q = MsQueryFactory.NewQuery("  SELECT database_id,create_date FROM sys.databases  for  JSON PATH").WithForJson();
+JArray result = q.ToJArray();
+JObject resultFirstRow = q.ToJObject();
+
+//класс WithForJson аналогично классу Query обладает свойствами withError (bool) и error (string)
+if(q.withError)
+    throw new Exception(q.error)
+```
 
 # Query Builder
-Класс для построения запросов
+Класс для построения update\insert запросов.
+Вставляемые\изменяемые поля добавляются с помощью метода AddUpsertParametr, который обязательно принимает в себя название колонки в БД (name) и значение
 
 # QueryList 
 Класс для выполнения нескольких запросов в рамках одной транзакции
+```c#
+QueryBuilder qb = new QueryBuilder();
+qb.SetMode(QueryBuilder.BuilderType.insert); //выбираем тип запроса update\insert
+qb.SetTableName("#temp");
+qb.AddUpsertParametr("id", new Random().Next()); //добавляем параметр для изменения колонки id
+DateTime oldDate = DateTime.Now.AddDays(-1);
+DateTime newDate = DateTime.Now;
+qb.AddUpsertParametr("date", newDate, oldDate); //парамерт будет добавлен в запрос только если newDate!=oldDate
+qb.SetWhereSqlPart("where count in (@Cnt)").AddParametr("@Cnt", new List<int>() { 1,2,3});//добавляем условие where
+qb.AddReturningValue("id"); // возвращаемое значение. доступно только для insert запросов (обертка для inserted.[название колонки])
+
+if(qb.HasUpsertParametrs()) //если нет параметров для обновления\вставки нет смысла выполнять запрос
+{
+    MsQuery q = qb.ToMsQuery();
+    if (q.Execute().withError)
+        throw new Exception(q.error);
+}
+```
+
+последовательность вызова методов не имеет значения. sql запрос формируется на этапе вызова метода ToMsQuery()
+этот же запрос можно написать в одну строку:
+```c#
+QueryBuilder qb = new QueryBuilder(QueryBuilder.BuilderType.insert).SetTableName("#temp").AddUpsertParametr("id", new Random().Next()).AddUpsertParametr("date", newDate, oldDate).SetWhereSqlPart("where count in (@Cnt)").AddParametr("@Cnt", new List<int>() { 1,2,3}).AddReturningValue("id");
+```
+
+# QueryList 
+Класс для выполнения нескольких запросов в рамках одной транзакции
+существует 2 режима: ручной коммит (метод) и авто (при вызове метода Execute())
+
+авто:
+```c#
+MsQueryList ql = MsQueryFactory.NewQueryList(continueIfError: false, manualTransaction: false);
+ql.AddNewQuery("insert into #temp (id) values (1)");
+ql.AddNewQuery("update #temp set id=1 where id=@id)").AddParameter("@id",32);
+ql.Execute();
+if (ql.withError)
+    throw new Exception(ql.GetErrorSplitString());
+```
+
+ручной режим (После вызова метода Execute() транзакция не закрывается):
+```c#
+using (MsQueryList ql = MsQueryFactory.NewQueryList(manualTransaction: true))
+{
+    ql.AddNewQuery("create table #temp ( id int)");
+    ql.Execute();
+    ql.AddNewQuery("insert into #temp (id) values (1)");
+    ql.AddNewQuery("insert into #temp (id) values (2)");
+    ql.AddNewQuery("insert into #temp (id) values (3)");
+    ql.AddNewQuery("insert into #temp (id) values (4)");
+    ql.Execute();
+    ql.AddNewQuery("delete from #temp where id=@id").AddParameter("@id", 3);
+    ql.Execute();
+    MsQuery q = ql.AddNewQuery("select count(*) from #temp");
+    int cnt=q.GetFirstCell<int>();
+    Console.WriteLine(cnt); //3
+    //ql.AddQuery(MsQueryFactory.NewQuery("exec dbo.proc1")); //допустимо добавление запросов, созданные вне MsQueryList
+    ql.ManualCommit();
+
+    if (ql.withError)
+        throw new Exception(ql.GetErrorSplitString());
+}
+```
+
+Если не вызывать метод ManualCommit() все изменения в БД будут отменены
+Вы можете отменить сделанные измения вызовом метода ManualRollback() (Только в ручном режиме до вызова ManualCommit())
